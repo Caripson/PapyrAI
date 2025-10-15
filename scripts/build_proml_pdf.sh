@@ -2,31 +2,31 @@
 set -euo pipefail
 
 # =========================================
-# build_proml_pdf.sh
+# build_proml_pdf.sh  — Build a single PDF from Markdown
 #
-# Bygger EN PDF ur Markdown i ordning:
+# Order:
 #   1) README.md (root, case-insensitive)
-#   2) docs/**/*.md (rekursivt, sorterat)
-#   3) *.md i repo-root (exkl. README)
-#   4) återstående mappar rekursivt (*.md), dubbletter filtreras
+#   2) docs/**/*.md (recursive, sorted)
+#   3) root-level *.md (excluding README)
+#   4) remaining folders recursively (*.md), deduped
 #
-# Egenskaper:
-# - Pandoc får varje fil separat (+ sidbrytning mellan), så relativa bildvägar bevaras.
-# - Tectonic (snap): tvåsteg md->TeX (skrivs i repo-root) -> PDF i cache OUTDIR.
-# - Badges & emojis strippas (kan stängas av via KEEP_BADGES/KEEP_EMOJI).
-# - Bilder verifieras via en Pandoc Lua-filter: tas endast med om de finns lokalt.
-#   (alt-text visas kursivt om bilden saknas; fjärr-URL:er plockas bort)
-# - Flagga: --no-images eller NO_IMAGES=1 för att helt stänga av bilder.
-# - Kodhighlight: välj tema via HL_STYLE (breezeDark/tango/pygments eller egen .theme)
+# Features:
+# - Feed Pandoc each file separately with page breaks -> preserves relative image paths.
+# - Tectonic snap workaround: md -> LaTeX written in repo-root, then tectonic to cache OUTDIR.
+# - Strip badges & emojis by default (configurable).
+# - Images verified by Lua filter: keep only if resolvable locally; else replace with alt text (or drop).
+# - --no-images / NO_IMAGES=1 to remove all images.
+# - Code blocks wrap lines, long URLs break; smaller monospace.
+# - Syntax highlighting theme via HL_STYLE (or custom .theme).
 #
-# CLI:
+# Usage:
 #   ./scripts/build_proml_pdf.sh --baseURL <path> --ALL [--exclude <glob> ...] [--no-images] <outfile.pdf>
 #
-# Miljö:
+# Env:
 #   HL_STYLE=breezeDark|tango|pygments|/path/to/custom.theme
-#   KEEP_BADGES=1  (behåll badges)
-#   KEEP_EMOJI=1   (behåll emojis)
-#   NO_IMAGES=1    (ta bort alla bilder oavsett)
+#   KEEP_BADGES=1   keep badges
+#   KEEP_EMOJI=1    keep emojis
+#   NO_IMAGES=1     remove all images
 # =========================================
 
 # ---- Defaults / Params ----
@@ -77,17 +77,17 @@ Usage:
   $(basename "$0") --baseURL <path> --ALL [--exclude <name|glob> ...] [--no-images] <outfile.pdf>
 
 Options:
-  --baseURL <path>     Repository root. Omittas -> 'git rev-parse' eller cwd.
-  --ALL                README -> docs/** -> root-*.md -> övriga mappar (rekursivt).
-  --exclude <pattern>  Case-insensitive glob (basename). Kan upprepas/komma-separeras.
-  --no-images          Ta bort alla bilder (kan även sättas via NO_IMAGES=1).
-  -h, --help           Visa hjälp.
+  --baseURL <path>     Repository root. If omitted -> 'git rev-parse' or cwd.
+  --ALL                README -> docs/** -> root-*.md -> rest (recursive).
+  --exclude <pattern>  Case-insensitive glob on basename. Repeat or comma-separate.
+  --no-images          Drop all images (same as NO_IMAGES=1).
+  -h, --help           Show help.
 
-Miljö:
+Env:
   HL_STYLE=<pandoc-theme|/path/to/theme> (default: ${HL_STYLE})
-  KEEP_BADGES=1  behåll badges
-  KEEP_EMOJI=1   behåll emojis (annars strippas för LaTeX-glyphs)
-  NO_IMAGES=1    ta bort alla bilder
+  KEEP_BADGES=1   keep badges
+  KEEP_EMOJI=1    keep emojis (else stripped for LaTeX glyphs)
+  NO_IMAGES=1     drop all images
 EOF
 }
 
@@ -154,7 +154,7 @@ add_file() {
 
 $DO_ALL || die "You must pass --ALL for this collection mode."
 
-# 1) README i root
+# 1) README in root
 shopt -s nullglob
 for r in README.md Readme.md readme.md; do
   if [ -f "$r" ]; then add_file "$r"; break; fi
@@ -169,7 +169,7 @@ if [ -d "docs" ]; then
   )
 fi
 
-# 3) root-level *.md (exkl. README)
+# 3) root-level *.md (excluding README)
 while IFS= read -r -d '' f; do
   case "$(basename "$f")" in README.md|Readme.md|readme.md) continue;; esac
   add_file "$f"
@@ -179,7 +179,7 @@ done < <(
     -type f -iname '*.md' -print0 | sort -z
 )
 
-# 4) övriga mappar rekursivt
+# 4) remaining folders recursively
 while IFS= read -r -d '' f; do add_file "$f"; done < <(
   LC_ALL=C find . -mindepth 2 \
     -type d \( $PRUNE_DIRS \) -prune -o \
@@ -196,50 +196,54 @@ TMP_DIR="$(mktemp -d)"
 BREAK_MD="$TMP_DIR/___BREAK___.md"
 printf '\n\n<div style="page-break-after: always;"></div>\n\n\\newpage\n\n' > "$BREAK_MD"
 
-# ---- Build resource-path (alla mappar i repo:t, men pruna skräp) ----
+# ---- resource-path (all dirs, pruned) ----
 RESOURCE_PATH="$BASEURL"
 while IFS= read -r -d '' d; do
   RESOURCE_PATH="$RESOURCE_PATH:$d"
 done < <(LC_ALL=C find "$BASEURL" -type d \( $PRUNE_DIRS \) -prune -o -type d -print0 | sort -z)
 
-# ---- Find image directories + parents; generate \graphicspath + Lua filter search-list ----
+# ---- header.tex (graphicx + wrap code + url breaking + \graphicspath) ----
 HEADER_TEX="$TMP_DIR/header.tex"
-declare -a CHECK_DIRS=()  # absolut-sökvägar vi testar i Lua-filtret
-
 {
   echo "% Auto-generated by build_proml_pdf.sh"
   echo "\\usepackage{graphicx}"
+  cat <<'LATEX'
+\usepackage{fvextra}
+\usepackage[hyphens]{url}
+\usepackage{hyperref}
+\hypersetup{breaklinks=true}
+\Urlmuskip=0mu plus 1mu\relax
+\DefineVerbatimEnvironment{Highlighting}{Verbatim}{
+  breaklines, breakanywhere, commandchars=\\\{\}, fontsize=\small, numbers=left, numbersep=3pt
+}
+\RecustomVerbatimEnvironment{verbatim}{Verbatim}{
+  breaklines, breakanywhere, fontsize=\small
+}
+\setlength{\emergencystretch}{3em}
+LATEX
 
+  # Collect image dirs and their parents, for \graphicspath
   mapfile -t IMGDIRS < <(
     LC_ALL=C find "$BASEURL" \
       -type d \( $PRUNE_DIRS \) -prune -o \
       -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.pdf' -o -iname '*.eps' \) \
       -printf '%h\n' | sort -u
   )
-
   declare -A SEEN_DIR=()
   ALLPATHS=()
   for d in "${IMGDIRS[@]}"; do
     rel="${d#$BASEURL}"; [ -z "$rel" ] && rel="/"
     rel="${rel%/}"
     parent="$(dirname "$rel")"; parent="${parent%/}"
-
     for p in "$parent" "$rel"; do
       [ -z "$p" ] && p="/"
       key="$p/"
       if [[ -z "${SEEN_DIR[$key]+x}" ]]; then
         SEEN_DIR[$key]=1
         ALLPATHS+=("$key")
-        # lägg till i CHECK_DIRS (absolut path)
-        if [ "$p" = "/" ]; then
-          CHECK_DIRS+=("$BASEURL")
-        else
-          CHECK_DIRS+=("$BASEURL/$p")
-        fi
       fi
     done
   done
-
   if [ "${#ALLPATHS[@]}" -gt 0 ]; then
     printf "\\graphicspath{"
     for p in "${ALLPATHS[@]}"; do printf "{%s}" "$p"; done
@@ -247,8 +251,7 @@ declare -a CHECK_DIRS=()  # absolut-sökvägar vi testar i Lua-filtret
   fi
 } > "$HEADER_TEX"
 
-# ---- Lua-filter: 1) verifiera lokala bilder 2) strippa <img> HTML 3) droppa fjärr-URL ----
-#     - Om NO_IMAGES=true: ersätt med "strip all images"-filter.
+# ---- Lua filter: verify local images (or drop/replace), strip HTML <img> ----
 LUA_FILTER="$TMP_DIR/verify_images.lua"
 if $NO_IMAGES || [ "${NO_IMAGES:-0}" = "1" ]; then
   cat > "$LUA_FILTER" <<'LUA'
@@ -266,12 +269,21 @@ function RawInline(el)
 end
 LUA
 else
-  # Bygg Lua-lista av sökvägar
+  # Build list of search dirs: repo root + parents from graphicspath
   printf 'SEARCH_DIRS = {' > "$LUA_FILTER"
   printf '"%s",' "$BASEURL" >> "$LUA_FILTER"
-  for d in "${CHECK_DIRS[@]}"; do
-    printf '"%s",' "$d" >> "$LUA_FILTER"
-  done
+  while IFS= read -r line; do
+    case "$line" in
+      *\\graphicspath*) ;;
+      *"{"*"}"*)
+        paths="$(printf '%s\n' "$line" | sed -n 's/.*\\graphicspath{\(.*\)}/\1/p' | tr -d '{}' )"
+        for p in $paths; do
+          pp="${p#/}"; pp="${pp%/}"
+          if [ -n "$pp" ]; then printf '"%s/%s",' "$BASEURL" "$pp" >> "$LUA_FILTER"; else printf '"%s",' "$BASEURL" >> "$LUA_FILTER"; fi
+        done
+        ;;
+    esac
+  done < "$HEADER_TEX"
   printf '}\n' >> "$LUA_FILTER"
 
   cat >> "$LUA_FILTER" <<'LUA'
@@ -281,9 +293,7 @@ local function exists(p)
 end
 
 local function try_resolve(src)
-  -- 1) Absolut eller relativ som redan finns
   if exists(src) then return src end
-  -- 2) Testa mot alla kända kataloger
   for _,d in ipairs(SEARCH_DIRS or {}) do
     local p = (d .. "/" .. src):gsub("/+", "/")
     if exists(p) then return p end
@@ -294,7 +304,6 @@ end
 function Image(el)
   local src = el.src or ""
   if src:match("^https?://") then
-    -- Droppa fjärrbilder (badges m.m.); behåll alt som text
     if el.caption and #el.caption > 0 then
       return pandoc.Emph(el.caption)
     end
@@ -305,7 +314,6 @@ function Image(el)
     el.src = resolved
     return el
   end
-  -- Hittades inte → ersätt med alt/caption
   if el.caption and #el.caption > 0 then
     return pandoc.Emph(el.caption)
   end
@@ -320,13 +328,13 @@ end
 LUA
 fi
 
-# ---- Cleaners (badges + emoji) per fil ----
+# ---- Cleaners (badges + emoji) per file ----
 clean_one() {
   local src="$1"; local idx="$2"
   local out="$TMP_DIR/$(printf '%04d' "$idx")-$(basename "$src")"
   cp "$src" "$out"
 
-  # Badges -> strip (om inte KEEP_BADGES)
+  # Strip badges unless KEEP_BADGES=1
   if [ "${KEEP_BADGES:-0}" != "1" ]; then
     perl -0777 -pe '
       s{\[!\[[^\]]*?\]\((https?:\/\/[^\)\s]+)\)\]\([^\)]*?\)}{
@@ -354,19 +362,19 @@ clean_one() {
       }gexm' -i "$out"
   fi
 
-  # Emojis -> strip (om inte KEEP_EMOJI)
+  # Strip emojis unless KEEP_EMOJI=1
   if [ "${KEEP_EMOJI:-0}" != "1" ]; then
     perl -CS -Mutf8 -pe '
-      s/[\x{1F300}-\x{1FAFF}]//g;  # Symbols & Pictographs
-      s/[\x{1F600}-\x{1F64F}]//g;  # Emoticons
-      s/[\x{1F1E6}-\x{1F1FF}]//g;  # Regional flags
-      s/[\x{2600}-\x{27BF}]//g;    # Misc symbols & dingbats
-      s/\x{FE0F}//g;               # Variation Selector-16
-      s/\x{200D}//g;               # Zero Width Joiner
+      s/[\x{1F300}-\x{1FAFF}]//g;
+      s/[\x{1F600}-\x{1F64F}]//g;
+      s/[\x{1F1E6}-\x{1F1FF}]//g;
+      s/[\x{2600}-\x{27BF}]//g;
+      s/\x{FE0F}//g;
+      s/\x{200D}//g;
     ' -i "$out"
   fi
 
-  # Komprimera tomrader
+  # Collapse extra blank lines
   awk 'BEGIN{b=0} { if ($0 ~ /^[[:space:]]*$/) { if (!b) print; b=1 } else { print; b=0 } }' "$out" > "$out.tmp" && mv "$out.tmp" "$out"
 
   printf '%s\n' "$out"
@@ -424,5 +432,5 @@ fi
 
 set +x
 echo "✅ Done: $OUTFILE"
-echo "🧹 Temp dir: $TMP_DIR (du kan ta bort den när du vill)"
+echo "🧹 Temp dir: $TMP_DIR (you can remove it whenever)"
 
