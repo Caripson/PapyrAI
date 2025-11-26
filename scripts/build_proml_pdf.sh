@@ -5,22 +5,26 @@ set -euo pipefail
 # build_proml_pdf.sh  — Build a single PDF from Markdown
 #
 # Order:
-#   1) README.md (root, case-insensitive)
-#   2) docs/**/*.md (recursive, sorted)
-#   3) root-level *.md (excluding README)
-#   4) remaining folders recursively (*.md), deduped
+#   0) Optional intro text (--intro)
+#   1) Optional scraped URL content (--url)
+#   2) README.md (root, case-insensitive)
+#   3) docs/**/*.md (recursive, sorted)
+#   4) root-level *.md (excluding README)
+#   5) remaining folders recursively (*.md), deduped
+#   6) Optional credits (--credits)
 #
 # Features:
 # - Feed Pandoc each file separately with page breaks -> preserves relative image paths.
 # - Tectonic snap workaround: md -> LaTeX written in repo-root, then tectonic to cache OUTDIR.
 # - Strip badges & emojis by default (configurable).
 # - Images verified by Lua filter: keep only if resolvable locally; else replace with alt text (or drop).
+# - Optional intro text, scraped web content, and credits sections.
 # - --no-images / NO_IMAGES=1 to remove all images.
 # - Code blocks wrap lines, long URLs break; smaller monospace.
 # - Syntax highlighting theme via HL_STYLE (or custom .theme).
 #
 # Usage:
-#   ./scripts/build_proml_pdf.sh --baseURL <path> --ALL [--exclude <glob> ...] [--no-images] <outfile.pdf>
+#   ./scripts/build_proml_pdf.sh --baseURL <path> --ALL [--intro "<text>"] [--url <https://...>] [--credits "<text>"] [--exclude <glob> ...] [--no-images] <outfile.pdf>
 #
 # Env:
 #   HL_STYLE=breezeDark|tango|pygments|/path/to/custom.theme
@@ -35,6 +39,9 @@ DO_ALL=false
 declare -a EXCLUDES=()
 OUTFILE=""
 NO_IMAGES=false
+INTRO_TEXT=""
+URL_INPUT=""
+CREDITS_TEXT=""
 
 # ---- Config ----
 HL_STYLE="${HL_STYLE:-breezeDark}"
@@ -81,6 +88,9 @@ Options:
   --ALL                README -> docs/** -> root-*.md -> rest (recursive).
   --exclude <pattern>  Case-insensitive glob on basename. Repeat or comma-separate.
   --no-images          Drop all images (same as NO_IMAGES=1).
+  --intro "<text>"     Prepend an intro section.
+  --url <https://...>  Fetch a web page and include its content (HTML -> Markdown).
+  --credits "<text>"   Append a credits section.
   -h, --help           Show help.
 
 Env:
@@ -99,6 +109,9 @@ while (( "$#" )); do
     --ALL) DO_ALL=true;;
     --exclude) shift; [ $# -gt 0 ] || die "--exclude needs a value"; EXCLUDES+=("$1");;
     --no-images) NO_IMAGES=true;;
+    --intro) shift; [ $# -gt 0 ] || die "--intro needs a value"; INTRO_TEXT="$1";;
+    --url) shift; [ $# -gt 0 ] || die "--url needs a value"; URL_INPUT="$1";;
+    --credits) shift; [ $# -gt 0 ] || die "--credits needs a value"; CREDITS_TEXT="$1";;
     -h|--help) usage; exit 0;;
     --) shift; break;;
     -* ) die "Unknown option: $1";;
@@ -186,15 +199,65 @@ while IFS= read -r -d '' f; do add_file "$f"; done < <(
     -type f -iname '*.md' -print0 | sort -z
 )
 
-[ "${#FILES[@]}" -gt 0 ] || die "No markdown files collected."
-
-echo "Including ${#FILES[@]} markdown files (base: $BASEURL):"
-for f in "${FILES[@]}"; do echo " - $f"; done
+EXTRA_SECTION_COUNT=0
+[ -n "$INTRO_TEXT" ] && EXTRA_SECTION_COUNT=$((EXTRA_SECTION_COUNT + 1))
+[ -n "$URL_INPUT" ] && EXTRA_SECTION_COUNT=$((EXTRA_SECTION_COUNT + 1))
+[ -n "$CREDITS_TEXT" ] && EXTRA_SECTION_COUNT=$((EXTRA_SECTION_COUNT + 1))
+TOTAL_SECTIONS=$(( ${#FILES[@]} + EXTRA_SECTION_COUNT ))
+[ "$TOTAL_SECTIONS" -gt 0 ] || die "No markdown content collected (no .md files and no --intro/--url/--credits provided)."
 
 # ---- TMP & BREAK ----
 TMP_DIR="$(mktemp -d)"
 BREAK_MD="$TMP_DIR/___BREAK___.md"
 printf '\n\n<div style="page-break-after: always;"></div>\n\n\\newpage\n\n' > "$BREAK_MD"
+
+# ---- Optional intro / url / credits sections ----
+make_intro_md() {
+  [ -n "$INTRO_TEXT" ] || return 1
+  local f="$TMP_DIR/intro.md"
+  {
+    echo "# Introduction"
+    echo
+    printf '%s\n' "$INTRO_TEXT"
+  } > "$f"
+  echo "$f"
+}
+
+make_credits_md() {
+  [ -n "$CREDITS_TEXT" ] || return 1
+  local f="$TMP_DIR/credits.md"
+  {
+    echo "# Credits"
+    echo
+    printf '%s\n' "$CREDITS_TEXT"
+  } > "$f"
+  echo "$f"
+}
+
+make_url_md() {
+  [ -n "$URL_INPUT" ] || return 1
+  case "$URL_INPUT" in http://*|https://*) ;; *) die "--url must start with http:// or https://";; esac
+  need curl || die "--url requires 'curl' to fetch content"
+  local f_html="$TMP_DIR/url_fetch.html"
+  local f_md="$TMP_DIR/url_content.md"
+  local host
+
+  curl -fsSL --retry 2 --retry-delay 1 --max-time 30 "$URL_INPUT" -o "$f_html" \
+    || die "Failed to fetch URL: $URL_INPUT"
+
+  pandoc --from=html --to=gfm --wrap=none --quiet -o "${f_md}.body" "$f_html" \
+    || die "Failed to convert fetched HTML to Markdown (pandoc). URL: $URL_INPUT"
+
+  host="$(printf '%s\n' "$URL_INPUT" | sed -n 's#^[A-Za-z][A-Za-z0-9+.-]*://##p' | cut -d/ -f1)"
+  {
+    printf '# Imported from %s\n\n' "${host:-$URL_INPUT}"
+    printf '_Source: %s_\n\n' "$URL_INPUT"
+    cat "${f_md}.body"
+  } > "$f_md"
+  rm -f "${f_md}.body"
+
+  echo "$f_md"
+}
 
 # ---- resource-path (all dirs, pruned) ----
 RESOURCE_PATH="$BASEURL"
@@ -380,14 +443,40 @@ clean_one() {
   printf '%s\n' "$out"
 }
 
+# ---- Build ordered content list (intro/url + files + credits) ----
+declare -a RAW_SECTIONS=()
+INTRO_MD=""; URL_MD=""; CREDITS_MD=""
+if [ -n "$INTRO_TEXT" ]; then INTRO_MD="$(make_intro_md)"; fi
+if [ -n "$URL_INPUT" ]; then URL_MD="$(make_url_md)"; fi
+if [ -n "$CREDITS_TEXT" ]; then CREDITS_MD="$(make_credits_md)"; fi
+
+[ -n "$INTRO_MD" ] && RAW_SECTIONS+=("$INTRO_MD")
+[ -n "$URL_MD" ] && RAW_SECTIONS+=("$URL_MD")
+RAW_SECTIONS+=("${FILES[@]}")
+[ -n "$CREDITS_MD" ] && RAW_SECTIONS+=("$CREDITS_MD")
+
+echo "Including ${#RAW_SECTIONS[@]} markdown sections (base: $BASEURL):"
+for f in "${RAW_SECTIONS[@]}"; do
+  case "$f" in
+    "$INTRO_MD") echo " - [intro]    $f";;
+    "$URL_MD") echo " - [url]      $f";;
+    "$CREDITS_MD") echo " - [credits]  $f";;
+    *) echo " - $f";;
+  esac
+done
+
 # ---- Clean all & prepare inputs with breaks ----
-declare -a INPUTS=()
+declare -a CLEANED_SECTIONS=()
 i=0
-for f in "${FILES[@]}"; do
+for f in "${RAW_SECTIONS[@]}"; do
   i=$((i+1))
-  cleaned="$(clean_one "$f" "$i")"
-  INPUTS+=("$cleaned")
-  if [ "$i" -lt "${#FILES[@]}" ]; then
+  CLEANED_SECTIONS+=("$(clean_one "$f" "$i")")
+done
+
+declare -a INPUTS=()
+for idx in "${!CLEANED_SECTIONS[@]}"; do
+  INPUTS+=("${CLEANED_SECTIONS[$idx]}")
+  if [ "$idx" -lt $(( ${#CLEANED_SECTIONS[@]} - 1 )) ]; then
     INPUTS+=("$BREAK_MD")
   fi
 done
@@ -433,4 +522,3 @@ fi
 set +x
 echo "✅ Done: $OUTFILE"
 echo "🧹 Temp dir: $TMP_DIR (you can remove it whenever)"
-
