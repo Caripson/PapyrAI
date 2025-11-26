@@ -27,7 +27,8 @@ with page breaks, table of contents, syntax highlighting, and consistent style.
 - 🎨 **Syntax highlighting** (`--highlight-style=kate`)
 - 🧠 **Supports Tectonic / wkhtmltopdf / xelatex / pdflatex**
 - 🪶 **No dependencies beyond Pandoc**
-- 🗒️ **Optional intro, web-scraped section, and credits**
+- 🗒️ **Optional intro, URL-metadata intro, web-scraped section, and credits**
+- 🗺️ **Batch mode from sitemap.xml (one PDF per URL, preserving path structure)**
 - 💡 **Perfect for NotebookLM, whitepapers, and versioned docs**
 - 🧰 **Clean temp handling & exclusion filters** (`--exclude`)
 
@@ -52,7 +53,7 @@ brew install pandoc tectonic
 ## ⚙️ Usage
 
 ```bash
-./scripts/build_proml_pdf.sh --baseURL <path> --ALL [--intro "<text>"] [--url <https://...>] [--credits "<text>"] [--exclude <glob> ...] [--no-images] <outfile.pdf>
+./scripts/build_proml_pdf.sh --baseURL <path> --ALL [--intro "<text>"] [--url-meta <https://...>] [--url <https://...>] [--credits "<text>"] [--exclude <glob> ...] [--no-images] <outfile.pdf>
 ```
 
 ### Examples
@@ -68,6 +69,12 @@ brew install pandoc tectonic
 
 # Pull a web page into the PDF
 ./scripts/build_proml_pdf.sh --baseURL /path/to/project --ALL --url https://example.com/blog/post output.pdf
+
+# Use page metadata as the intro, plus the page content
+./scripts/build_proml_pdf.sh --baseURL /path/to/project --ALL \
+  --url-meta https://example.com/blog/post \
+  --url https://example.com/blog/post \
+  output.pdf
 
 # Only intro + URL + credits (utan lokala .md-filer)
 EMPTY_DIR=$(mktemp -d)
@@ -86,6 +93,17 @@ EMPTY_DIR=$(mktemp -d)
 
 # Custom metadata
 TITLE="ProML — AI Prompt Markup Language" AUTHOR="Johan Caripson" ./scripts/build_proml_pdf.sh --baseURL . --ALL output.pdf
+
+### Batch: sitemap.xml → en PDF per URL
+```bash
+# Hämtar sitemap, plockar titel/meta för filnamn (mellanslag → "_") och
+# sparar samma katalogstruktur som URL:en under ./exports
+./scripts/batch_sitemap_pdfs.sh --sitemap https://www.gymnasieskolan.se/sitemaps/kurser.xml \
+  --outdir ./exports
+
+# Begränsa till de första 5 URL:erna (t.ex. för snabbtest)
+./scripts/batch_sitemap_pdfs.sh --sitemap ./sitemap.xml --outdir ./exports --limit 5
+```
 ```
 
 ---

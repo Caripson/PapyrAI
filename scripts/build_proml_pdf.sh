@@ -6,25 +6,26 @@ set -euo pipefail
 #
 # Order:
 #   0) Optional intro text (--intro)
-#   1) Optional scraped URL content (--url)
-#   2) README.md (root, case-insensitive)
-#   3) docs/**/*.md (recursive, sorted)
-#   4) root-level *.md (excluding README)
-#   5) remaining folders recursively (*.md), deduped
-#   6) Optional credits (--credits)
+#   1) Optional URL metadata intro (--url-meta)
+#   2) Optional scraped URL content (--url)
+#   3) README.md (root, case-insensitive)
+#   4) docs/**/*.md (recursive, sorted)
+#   5) root-level *.md (excluding README)
+#   6) remaining folders recursively (*.md), deduped
+#   7) Optional credits (--credits)
 #
 # Features:
 # - Feed Pandoc each file separately with page breaks -> preserves relative image paths.
 # - Tectonic snap workaround: md -> LaTeX written in repo-root, then tectonic to cache OUTDIR.
 # - Strip badges & emojis by default (configurable).
 # - Images verified by Lua filter: keep only if resolvable locally; else replace with alt text (or drop).
-# - Optional intro text, scraped web content, and credits sections.
+# - Optional intro text, URL metadata intro, scraped web content, and credits sections.
 # - --no-images / NO_IMAGES=1 to remove all images.
 # - Code blocks wrap lines, long URLs break; smaller monospace.
 # - Syntax highlighting theme via HL_STYLE (or custom .theme).
 #
 # Usage:
-#   ./scripts/build_proml_pdf.sh --baseURL <path> --ALL [--intro "<text>"] [--url <https://...>] [--credits "<text>"] [--exclude <glob> ...] [--no-images] <outfile.pdf>
+#   ./scripts/build_proml_pdf.sh --baseURL <path> --ALL [--intro "<text>"] [--url-meta <https://...>] [--url <https://...>] [--credits "<text>"] [--exclude <glob> ...] [--no-images] <outfile.pdf>
 #
 # Env:
 #   HL_STYLE=breezeDark|tango|pygments|/path/to/custom.theme
@@ -41,6 +42,7 @@ OUTFILE=""
 NO_IMAGES=false
 INTRO_TEXT=""
 URL_INPUT=""
+URL_META_INPUT=""
 CREDITS_TEXT=""
 
 # ---- Config ----
@@ -81,7 +83,7 @@ is_excluded() {
 usage() {
   cat <<EOF
 Usage:
-  $(basename "$0") --baseURL <path> --ALL [--exclude <name|glob> ...] [--no-images] <outfile.pdf>
+  $(basename "$0") --baseURL <path> --ALL [--intro "<text>"] [--url-meta <https://...>] [--url <https://...>] [--credits "<text>"] [--exclude <name|glob> ...] [--no-images] <outfile.pdf>
 
 Options:
   --baseURL <path>     Repository root. If omitted -> 'git rev-parse' or cwd.
@@ -89,6 +91,8 @@ Options:
   --exclude <pattern>  Case-insensitive glob on basename. Repeat or comma-separate.
   --no-images          Drop all images (same as NO_IMAGES=1).
   --intro "<text>"     Prepend an intro section.
+  --url-meta <https://...>
+                        Fetch <title>/<meta> from a page and prepend as intro.
   --url <https://...>  Fetch a web page and include its content (HTML -> Markdown).
   --credits "<text>"   Append a credits section.
   -h, --help           Show help.
@@ -110,6 +114,7 @@ while (( "$#" )); do
     --exclude) shift; [ $# -gt 0 ] || die "--exclude needs a value"; EXCLUDES+=("$1");;
     --no-images) NO_IMAGES=true;;
     --intro) shift; [ $# -gt 0 ] || die "--intro needs a value"; INTRO_TEXT="$1";;
+    --url-meta) shift; [ $# -gt 0 ] || die "--url-meta needs a value"; URL_META_INPUT="$1";;
     --url) shift; [ $# -gt 0 ] || die "--url needs a value"; URL_INPUT="$1";;
     --credits) shift; [ $# -gt 0 ] || die "--credits needs a value"; CREDITS_TEXT="$1";;
     -h|--help) usage; exit 0;;
@@ -201,17 +206,18 @@ while IFS= read -r -d '' f; do add_file "$f"; done < <(
 
 EXTRA_SECTION_COUNT=0
 [ -n "$INTRO_TEXT" ] && EXTRA_SECTION_COUNT=$((EXTRA_SECTION_COUNT + 1))
+[ -n "$URL_META_INPUT" ] && EXTRA_SECTION_COUNT=$((EXTRA_SECTION_COUNT + 1))
 [ -n "$URL_INPUT" ] && EXTRA_SECTION_COUNT=$((EXTRA_SECTION_COUNT + 1))
 [ -n "$CREDITS_TEXT" ] && EXTRA_SECTION_COUNT=$((EXTRA_SECTION_COUNT + 1))
 TOTAL_SECTIONS=$(( ${#FILES[@]} + EXTRA_SECTION_COUNT ))
-[ "$TOTAL_SECTIONS" -gt 0 ] || die "No markdown content collected (no .md files and no --intro/--url/--credits provided)."
+[ "$TOTAL_SECTIONS" -gt 0 ] || die "No markdown content collected (no .md files and no --intro/--url-meta/--url/--credits provided)."
 
 # ---- TMP & BREAK ----
 TMP_DIR="$(mktemp -d)"
 BREAK_MD="$TMP_DIR/___BREAK___.md"
 printf '\n\n<div style="page-break-after: always;"></div>\n\n\\newpage\n\n' > "$BREAK_MD"
 
-# ---- Optional intro / url / credits sections ----
+# ---- Optional intro / url-meta / url / credits sections ----
 make_intro_md() {
   [ -n "$INTRO_TEXT" ] || return 1
   local f="$TMP_DIR/intro.md"
@@ -221,6 +227,78 @@ make_intro_md() {
     printf '%s\n' "$INTRO_TEXT"
   } > "$f"
   echo "$f"
+}
+
+make_url_meta_md() {
+  [ -n "$URL_META_INPUT" ] || return 1
+  case "$URL_META_INPUT" in http://*|https://*) ;; *) die "--url-meta must start with http:// or https://";; esac
+  need curl || die "--url-meta requires 'curl' to fetch content"
+  local f_html="$TMP_DIR/url_meta_fetch.html"
+  local f_md="$TMP_DIR/url_meta_intro.md"
+
+  curl -fsSL --retry 2 --retry-delay 1 --max-time 30 "$URL_META_INPUT" -o "$f_html" \
+    || die "Failed to fetch metadata URL: $URL_META_INPUT"
+
+  python3 - "$URL_META_INPUT" "$f_html" "$f_md" <<'PY'
+import sys
+from html.parser import HTMLParser
+from pathlib import Path
+
+url, html_path, out_path = sys.argv[1:4]
+text = Path(html_path).read_text(encoding="utf-8", errors="ignore")
+
+
+class MetaParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.in_title = False
+        self.title_parts = []
+        self.meta = {}
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag == "title":
+            self.in_title = True
+        if tag == "meta":
+            data = {k.lower(): (v or "").strip() for k, v in attrs}
+            name = data.get("name") or data.get("property")
+            content = data.get("content")
+            if name and content and name.lower() not in self.meta:
+                self.meta[name.lower()] = content.strip()
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "title":
+            self.in_title = False
+
+    def handle_data(self, data):
+        if self.in_title:
+            self.title_parts.append(data)
+
+
+parser = MetaParser()
+parser.feed(text)
+
+title = " ".join(parser.title_parts).strip()
+for key in ("og:title", "twitter:title"):
+    if not title and key in parser.meta:
+        title = parser.meta[key]
+
+description = ""
+for key in ("description", "og:description", "twitter:description"):
+    val = parser.meta.get(key, "").strip()
+    if val:
+        description = val
+        break
+
+lines = []
+lines.append(f"# {title or 'Imported Page'}")
+if description:
+    lines.extend(["", description])
+lines.extend(["", f"_Source: {url}_"])
+Path(out_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+
+  echo "$f_md"
 }
 
 make_credits_md() {
@@ -443,14 +521,16 @@ clean_one() {
   printf '%s\n' "$out"
 }
 
-# ---- Build ordered content list (intro/url + files + credits) ----
+# ---- Build ordered content list (intro/url-meta/url + files + credits) ----
 declare -a RAW_SECTIONS=()
-INTRO_MD=""; URL_MD=""; CREDITS_MD=""
+INTRO_MD=""; URL_META_MD=""; URL_MD=""; CREDITS_MD=""
 if [ -n "$INTRO_TEXT" ]; then INTRO_MD="$(make_intro_md)"; fi
+if [ -n "$URL_META_INPUT" ]; then URL_META_MD="$(make_url_meta_md)"; fi
 if [ -n "$URL_INPUT" ]; then URL_MD="$(make_url_md)"; fi
 if [ -n "$CREDITS_TEXT" ]; then CREDITS_MD="$(make_credits_md)"; fi
 
 [ -n "$INTRO_MD" ] && RAW_SECTIONS+=("$INTRO_MD")
+[ -n "$URL_META_MD" ] && RAW_SECTIONS+=("$URL_META_MD")
 [ -n "$URL_MD" ] && RAW_SECTIONS+=("$URL_MD")
 RAW_SECTIONS+=("${FILES[@]}")
 [ -n "$CREDITS_MD" ] && RAW_SECTIONS+=("$CREDITS_MD")
@@ -459,6 +539,7 @@ echo "Including ${#RAW_SECTIONS[@]} markdown sections (base: $BASEURL):"
 for f in "${RAW_SECTIONS[@]}"; do
   case "$f" in
     "$INTRO_MD") echo " - [intro]    $f";;
+    "$URL_META_MD") echo " - [url-meta] $f";;
     "$URL_MD") echo " - [url]      $f";;
     "$CREDITS_MD") echo " - [credits]  $f";;
     *) echo " - $f";;
